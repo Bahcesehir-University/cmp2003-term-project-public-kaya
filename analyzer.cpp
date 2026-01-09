@@ -77,6 +77,43 @@ static inline bool hour24(const char* a, const char* b, int& outH) {
     return true;
 }
 
+static inline void processLine(unordered_map<string, TripAnalyzer::ZoneStats>& zones,
+                               const char* lb, const char* le,
+                               bool& bomDone, bool& headerDone) {
+    if (le > lb && le[-1] == '\r') --le;
+    if (lb >= le) return;
+
+    const char* a = lb; const char* b = le;
+    while (a < b && ws(*a)) ++a;
+    if (a >= b) return;
+
+    if (!bomDone) { dropBom(a, b); bomDone = true; }
+    while (a < b && ws(*a)) ++a;
+    if (a >= b) return;
+
+    const char *c0a,*c0b,*c1a,*c1b,*c3a,*c3b;
+    if (!cut6(a,b,c0a,c0b,c1a,c1b,c3a,c3b)) return;
+
+    const char* idA = c0a; const char* idB = c0b;
+    trimPtr(idA, idB);
+    if (idA >= idB) return;
+
+    if (!headerDone) headerDone = true;
+    if ((idB - idA) == 6 && memcmp(idA, "TripID", 6) == 0) return;
+
+    const char* zA = c1a; const char* zB = c1b;
+    trimPtr(zA, zB);
+    if (zA >= zB) return;
+
+    int hr;
+    if (!hour24(c3a, c3b, hr)) return;
+
+    string key(zA, zB - zA);
+    auto it = zones.try_emplace(move(key), TripAnalyzer::ZoneStats()).first;
+    ++it->second.total;
+    ++it->second.byHour[hr];
+}
+
 void TripAnalyzer::ingestFile(const string& csvPath) {
     FILE* f = fopen(csvPath.c_str(), "rb");
     if (!f) return;
@@ -100,48 +137,21 @@ void TripAnalyzer::ingestFile(const string& csvPath) {
             const char* nl = (const char*)memchr(p, '\n', end - p);
             if (!nl) { carry.append(p, end - p); break; }
 
-            const char* lb = carry.empty() ? p : (carry.append(p, nl - p), carry.data());
-            const char* le = carry.empty() ? nl : carry.data() + carry.size();
-
-            if (le > lb && le[-1] == '\r') --le;
-            if (lb < le) {
-                const char* a = lb; const char* b = le;
-                while (a < b && ws(*a)) ++a;
-                if (a < b) {
-                    if (!bomDone) { dropBom(a, b); bomDone = true; }
-                    while (a < b && ws(*a)) ++a;
-                    if (a < b) {
-                        const char *c0a,*c0b,*c1a,*c1b,*c3a,*c3b;
-                        if (cut6(a,b,c0a,c0b,c1a,c1b,c3a,c3b)) {
-                            const char* idA = c0a; const char* idB = c0b;
-                            trimPtr(idA, idB);
-                            if (idA < idB) {
-                                if (!headerDone) headerDone = true;
-                                if (!((idB - idA) == 6 && memcmp(idA, "TripID", 6) == 0)) {
-                                    const char* zA = c1a; const char* zB = c1b;
-                                    trimPtr(zA, zB);
-                                    if (zA < zB) {
-                                        int hr;
-                                        if (hour24(c3a, c3b, hr)) {
-                                            string key(zA, zB - zA);
-                                            auto it = zones.try_emplace(move(key), ZoneStats()).first;
-                                            ++it->second.total;
-                                            ++it->second.byHour[hr];
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            if (!carry.empty()) {
+                carry.append(p, nl - p);
+                processLine(zones, carry.data(), carry.data() + carry.size(), bomDone, headerDone);
+                carry.clear();
+            } else {
+                processLine(zones, p, nl, bomDone, headerDone);
             }
-            carry.clear();
             p = nl + 1;
         }
     }
+
     if (!carry.empty()) {
-        // process final carry line (same logic as above)
+        processLine(zones, carry.data(), carry.data() + carry.size(), bomDone, headerDone);
     }
+
     fclose(f);
 }
 
