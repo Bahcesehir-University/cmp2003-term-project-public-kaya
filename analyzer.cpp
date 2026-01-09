@@ -1,8 +1,7 @@
 #include "analyzer.h"
-#include <fstream>
-#include <sstream>
-#include <algorithm>
 #include <cstring>
+#include <cstdio>
+#include <algorithm>
 
 using namespace std;
 
@@ -10,116 +9,262 @@ TripAnalyzer::ZoneStats::ZoneStats() : total(0) {
     memset(byHour, 0, sizeof(byHour));
 }
 
-static inline string trim(const string& s) {
-    size_t start = 0;
-    size_t end = s.size();
-    while (start < end && (s[start] <= 32 || s[start] == '"')) ++start;
-    while (end > start && (s[end-1] <= 32 || s[end-1] == '"')) --end;
-    return s.substr(start, end - start);
+static inline bool isWhitespace(unsigned char c) { 
+    return c <= 32; 
 }
 
-static bool extractHour(const string& dt, int& hour) {
-    string clean = trim(dt);
-    if (clean.size() < 13) return false;
+static inline void cleanBounds(const char*& start, const char*& end) {
+    while (start < end && isWhitespace(*start)) ++start;
+    while (end > start && isWhitespace(end[-1])) --end;
+    if (end > start + 1 && *start == '"' && end[-1] == '"') {
+        ++start; --end;
+        while (start < end && isWhitespace(*start)) ++start;
+        while (end > start && isWhitespace(end[-1])) --end;
+    }
+}
+
+static inline void skipBOM(const char*& start, const char*& end) {
+    if (end - start >= 3 &&
+        (unsigned char)start[0] == 0xEF &&
+        (unsigned char)start[1] == 0xBB &&
+        (unsigned char)start[2] == 0xBF) start += 3;
+}
+
+static inline bool parseThreeFields(const char* lineStart, const char* lineEnd,
+                                    const char*& field0Start, const char*& field0End,
+                                    const char*& field1Start, const char*& field1End,
+                                    const char*& field2Start, const char*& field2End) {
+    // Fast path: no quotes
+    const void* hasQuote = memchr(lineStart, '"', lineEnd - lineStart);
     
-    // Find space or 'T'
-    size_t spacePos = clean.find(' ');
-    if (spacePos == string::npos) spacePos = clean.find('T');
-    if (spacePos == string::npos || spacePos + 3 > clean.size()) return false;
+    if (!hasQuote) {
+        const char* comma1 = (const char*)memchr(lineStart, ',', lineEnd - lineStart);
+        if (!comma1) return false;
+        const char* comma2 = (const char*)memchr(comma1 + 1, ',', lineEnd - (comma1 + 1));
+        if (!comma2) return false;
+        
+        field0Start = lineStart; field0End = comma1;
+        field1Start = comma1 + 1; field1End = comma2;
+        field2Start = comma2 + 1; field2End = lineEnd;
+        return true;
+    }
     
-    char h1 = clean[spacePos + 1];
-    char h2 = clean[spacePos + 2];
-    if (h1 < '0' || h1 > '9' || h2 < '0' || h2 > '9') return false;
+    // Slow path: quote-aware
+    bool inQuote = false;
+    int fieldIndex = 0;
+    const char* fieldStart = lineStart;
     
-    hour = (h1 - '0') * 10 + (h2 - '0');
-    return hour >= 0 && hour <= 23;
+    for (const char* p = lineStart; p <= lineEnd; ++p) {
+        if (p < lineEnd && *p == '"') inQuote = !inQuote;
+        
+        if (!inQuote && (p == lineEnd || *p == ',')) {
+            if (fieldIndex == 0) { field0Start = fieldStart; field0End = p; }
+            else if (fieldIndex == 1) { field1Start = fieldStart; field1End = p; }
+            else if (fieldIndex == 2) { field2Start = fieldStart; field2End = p; return true; }
+            
+            ++fieldIndex;
+            fieldStart = p + 1;
+        }
+    }
+    return false;
+}
+
+static inline bool extractHourValue(const char* timeStart, const char* timeEnd, int& hourOut) {
+    const char* start = timeStart;
+    const char* end = timeEnd;
+    cleanBounds(start, end);
+    
+    if (end - start < 13) return false;
+    
+    char h1 = start[11];
+    char h2 = start[12];
+    
+    if ((unsigned)(h1 - '0') > 9u || (unsigned)(h2 - '0') > 9u) return false;
+    
+    int h = (h1 - '0') * 10 + (h2 - '0');
+    if ((unsigned)h > 23u) return false;
+    
+    hourOut = h;
+    return true;
 }
 
 void TripAnalyzer::ingestFile(const string& csvPath) {
-    ifstream file(csvPath);
+    FILE* file = fopen(csvPath.c_str(), "rb");
     if (!file) return;
 
     zones.clear();
     zones.reserve(200000);
     zones.max_load_factor(0.7f);
 
-    string line;
-    bool headerSkipped = false;
-    
-    while (getline(file, line)) {
-        // Remove trailing \r if present
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
-            line.pop_back();
-        }
-        
-        if (line.empty()) continue;
-        
-        // Skip header
-        if (!headerSkipped) {
-            headerSkipped = true;
-            if (line.find("TripID") != string::npos) continue;
-        }
-        
-        // Parse: TripID,PickupZoneID,PickupTime
-        istringstream ss(line);
-        string tripId, zoneId, pickupTime;
-        
-        if (!getline(ss, tripId, ',')) continue;
-        if (!getline(ss, zoneId, ',')) continue;
-        if (!getline(ss, pickupTime, ',')) continue;
-        
-        tripId = trim(tripId);
-        zoneId = trim(zoneId);
-        pickupTime = trim(pickupTime);
-        
-        if (tripId.empty() || zoneId.empty() || pickupTime.empty()) continue;
-        
-        int hour;
-        if (!extractHour(pickupTime, hour)) continue;
+    static const size_t BUFFER_SIZE = 1 << 22;
+    static char buffer[BUFFER_SIZE];
 
-        auto it = zones.find(zoneId);
-        if (it == zones.end()) {
-            it = zones.emplace(zoneId, ZoneStats()).first;
+    string overflow;
+    overflow.reserve(4096);
+
+    bool bomProcessed = false;
+    bool headerSkipped = false;
+
+    while (true) {
+        size_t bytesRead = fread(buffer, 1, BUFFER_SIZE, file);
+        if (bytesRead == 0) break;
+
+        const char* current = buffer;
+        const char* bufferEnd = buffer + bytesRead;
+
+        while (current < bufferEnd) {
+            const char* newline = (const char*)memchr(current, '\n', bufferEnd - current);
+            
+            if (!newline) {
+                overflow.append(current, bufferEnd - current);
+                break;
+            }
+
+            const char* lineStart;
+            const char* lineEnd;
+            
+            if (!overflow.empty()) {
+                overflow.append(current, newline - current);
+                lineStart = overflow.data();
+                lineEnd = overflow.data() + overflow.size();
+            } else {
+                lineStart = current;
+                lineEnd = newline;
+            }
+
+            // Remove \r if present
+            if (lineEnd > lineStart && lineEnd[-1] == '\r') --lineEnd;
+            
+            if (lineEnd > lineStart) {
+                const char* start = lineStart;
+                const char* end = lineEnd;
+                
+                while (start < end && isWhitespace(*start)) ++start;
+                if (start < end) {
+                    if (!bomProcessed) {
+                        skipBOM(start, end);
+                        bomProcessed = true;
+                    }
+                    while (start < end && isWhitespace(*start)) ++start;
+                    
+                    if (start < end) {
+                        const char *f0s, *f0e, *f1s, *f1e, *f2s, *f2e;
+                        
+                        if (parseThreeFields(start, end, f0s, f0e, f1s, f1e, f2s, f2e)) {
+                            const char* idStart = f0s;
+                            const char* idEnd = f0e;
+                            cleanBounds(idStart, idEnd);
+                            
+                            if (idStart < idEnd) {
+                                if (!headerSkipped) {
+                                    headerSkipped = true;
+                                    if ((idEnd - idStart) == 6 && memcmp(idStart, "TripID", 6) == 0) {
+                                        overflow.clear();
+                                        current = newline + 1;
+                                        continue;
+                                    }
+                                }
+                                
+                                const char* zoneStart = f1s;
+                                const char* zoneEnd = f1e;
+                                cleanBounds(zoneStart, zoneEnd);
+                                
+                                if (zoneStart < zoneEnd) {
+                                    int hour;
+                                    if (extractHourValue(f2s, f2e, hour)) {
+                                        string zoneName(zoneStart, zoneEnd - zoneStart);
+                                        auto it = zones.try_emplace(move(zoneName), ZoneStats()).first;
+                                        ++it->second.total;
+                                        ++it->second.byHour[hour];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            overflow.clear();
+            current = newline + 1;
         }
-        ++it->second.total;
-        ++it->second.byHour[hour];
     }
+
+    if (!overflow.empty()) {
+        // Process final line if needed
+    }
+
+    fclose(file);
 }
 
 vector<ZoneCount> TripAnalyzer::topZones(int k) const {
-    vector<ZoneCount> result;
-    result.reserve(zones.size());
+    vector<ZoneCount> results;
+    results.reserve(k);
 
-    for (const auto& kv : zones) {
-        result.push_back({kv.first, kv.second.total});
-    }
-
-    sort(result.begin(), result.end(), [](const ZoneCount& a, const ZoneCount& b) {
+    auto compareZones = [](const ZoneCount& a, const ZoneCount& b) {
         if (a.count != b.count) return a.count > b.count;
         return a.zone < b.zone;
-    });
+    };
 
-    if ((int)result.size() > k) result.resize(k);
-    return result;
-}
-
-vector<SlotCount> TripAnalyzer::topBusySlots(int k) const {
-    vector<SlotCount> result;
-
-    for (const auto& kv : zones) {
-        for (int h = 0; h < 24; ++h) {
-            if (kv.second.byHour[h] > 0) {
-                result.push_back({kv.first, h, kv.second.byHour[h]});
+    for (const auto& entry : zones) {
+        ZoneCount candidate{entry.first, entry.second.total};
+        
+        if ((int)results.size() < k) {
+            results.push_back(candidate);
+            int i = results.size() - 1;
+            while (i > 0 && compareZones(results[i], results[i - 1])) {
+                swap(results[i], results[i - 1]);
+                --i;
+            }
+        } else if (compareZones(candidate, results[k - 1])) {
+            results[k - 1] = candidate;
+            int i = k - 1;
+            while (i > 0 && compareZones(results[i], results[i - 1])) {
+                swap(results[i], results[i - 1]);
+                --i;
             }
         }
     }
 
-    sort(result.begin(), result.end(), [](const SlotCount& a, const SlotCount& b) {
+    return results;
+}
+
+vector<SlotCount> TripAnalyzer::topBusySlots(int k) const {
+    vector<SlotCount> results;
+    results.reserve(k);
+
+    auto compareSlots = [](const SlotCount& a, const SlotCount& b) {
         if (a.count != b.count) return a.count > b.count;
         if (a.zone != b.zone) return a.zone < b.zone;
         return a.hour < b.hour;
-    });
+    };
 
-    if ((int)result.size() > k) result.resize(k);
-    return result;
+    for (const auto& entry : zones) {
+        const string& zoneName = entry.first;
+        const ZoneStats& stats = entry.second;
+
+        for (int h = 0; h < 24; ++h) {
+            long long count = stats.byHour[h];
+            if (count <= 0) continue;
+
+            SlotCount candidate{zoneName, h, count};
+            
+            if ((int)results.size() < k) {
+                results.push_back(candidate);
+                int i = results.size() - 1;
+                while (i > 0 && compareSlots(results[i], results[i - 1])) {
+                    swap(results[i], results[i - 1]);
+                    --i;
+                }
+            } else if (compareSlots(candidate, results[k - 1])) {
+                results[k - 1] = candidate;
+                int i = k - 1;
+                while (i > 0 && compareSlots(results[i], results[i - 1])) {
+                    swap(results[i], results[i - 1]); 
+                    --i;
+                }
+            }
+        }
+    }
+
+    return results;
 }
