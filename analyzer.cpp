@@ -11,9 +11,23 @@ TripAnalyzer::ZoneStats::ZoneStats() : total(0) {
 
 static bool extractHour(const string& dt, int& hour) {
     if (dt.size() < 13) return false;
-    size_t spacePos = dt.find(' ');
-    if (spacePos == string::npos) spacePos = dt.find('T');
-    if (spacePos == string::npos || spacePos + 3 > dt.size()) return false;
+    
+    // Trim whitespace and quotes
+    size_t start = 0;
+    size_t end = dt.size();
+    while (start < end && (dt[start] <= 32 || dt[start] == '"')) ++start;
+    while (end > start && (dt[end-1] <= 32 || dt[end-1] == '"')) --end;
+    if (end - start < 13) return false;
+    
+    // Find space or 'T'
+    size_t spacePos = string::npos;
+    for (size_t i = start; i < end; ++i) {
+        if (dt[i] == ' ' || dt[i] == 'T') {
+            spacePos = i;
+            break;
+        }
+    }
+    if (spacePos == string::npos || spacePos + 3 > end) return false;
     
     char h1 = dt[spacePos + 1];
     char h2 = dt[spacePos + 2];
@@ -24,26 +38,47 @@ static bool extractHour(const string& dt, int& hour) {
 }
 
 static bool parseLine(const string& line, string& zone, int& hour) {
-    size_t p0 = 0;
-    size_t p1 = line.find(',', p0);
-    if (p1 == string::npos) return false;
+    // Parse 6-field CSV: TripID,PickupZoneID,DropoffZoneID,PickupDateTime,DistanceKm,FareAmount
+    // We need field[1] (PickupZoneID) and field[3] (PickupDateTime)
     
-    p0 = p1 + 1;
-    p1 = line.find(',', p0);
-    if (p1 == string::npos) return false;
-    zone = line.substr(p0, p1 - p0);
-    if (zone.empty()) return false;
+    bool inQuote = false;
+    int fieldNum = 0;
+    size_t fieldStart = 0;
+    string pickupZone, pickupTime;
     
-    p0 = p1 + 1;
-    p1 = line.find(',', p0);
-    if (p1 == string::npos) return false;
+    for (size_t i = 0; i <= line.size(); ++i) {
+        if (i < line.size() && line[i] == '"') {
+            inQuote = !inQuote;
+        }
+        
+        if (!inQuote && (i == line.size() || line[i] == ',')) {
+            if (fieldNum == 1) {
+                // PickupZoneID
+                pickupZone = line.substr(fieldStart, i - fieldStart);
+            } else if (fieldNum == 3) {
+                // PickupDateTime
+                pickupTime = line.substr(fieldStart, i - fieldStart);
+            }
+            
+            fieldNum++;
+            fieldStart = i + 1;
+            
+            if (fieldNum > 3) break; // We have what we need
+        }
+    }
     
-    p0 = p1 + 1;
-    p1 = line.find(',', p0);
-    if (p1 == string::npos) return false;
-    string dt = line.substr(p0, p1 - p0);
+    if (pickupZone.empty()) return false;
     
-    return extractHour(dt, hour);
+    // Trim zone
+    size_t zstart = 0;
+    size_t zend = pickupZone.size();
+    while (zstart < zend && (pickupZone[zstart] <= 32 || pickupZone[zstart] == '"')) ++zstart;
+    while (zend > zstart && (pickupZone[zend-1] <= 32 || pickupZone[zend-1] == '"')) --zend;
+    
+    if (zstart >= zend) return false;
+    zone = pickupZone.substr(zstart, zend - zstart);
+    
+    return extractHour(pickupTime, hour);
 }
 
 void TripAnalyzer::ingestFile(const string& csvPath) {
@@ -55,10 +90,21 @@ void TripAnalyzer::ingestFile(const string& csvPath) {
     zones.max_load_factor(0.7f);
 
     string line;
-    if (!getline(file, line)) return;
-
+    bool headerSkipped = false;
+    
     while (getline(file, line)) {
+        // Remove trailing \r if present
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+            line.pop_back();
+        }
+        
         if (line.empty()) continue;
+        
+        // Skip header
+        if (!headerSkipped) {
+            headerSkipped = true;
+            if (line.find("TripID") != string::npos) continue;
+        }
         
         string zone;
         int hour;
