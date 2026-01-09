@@ -9,11 +9,11 @@ TripAnalyzer::ZoneStats::ZoneStats() : total(0) {
     memset(byHour, 0, sizeof(byHour));
 }
 
-static inline bool isWhitespace(unsigned char c) { 
+static bool isWhitespace(unsigned char c) { 
     return c <= 32; 
 }
 
-static inline void cleanBounds(const char*& start, const char*& end) {
+static void cleanBounds(const char*& start, const char*& end) {
     while (start < end && isWhitespace(*start)) ++start;
     while (end > start && isWhitespace(end[-1])) --end;
     if (end > start + 1 && *start == '"' && end[-1] == '"') {
@@ -23,18 +23,17 @@ static inline void cleanBounds(const char*& start, const char*& end) {
     }
 }
 
-static inline void skipBOM(const char*& start, const char*& end) {
+static void skipBOM(const char*& start, const char*& end) {
     if (end - start >= 3 &&
         (unsigned char)start[0] == 0xEF &&
         (unsigned char)start[1] == 0xBB &&
         (unsigned char)start[2] == 0xBF) start += 3;
 }
 
-static inline bool parseThreeFields(const char* lineStart, const char* lineEnd,
-                                    const char*& field0Start, const char*& field0End,
-                                    const char*& field1Start, const char*& field1End,
-                                    const char*& field2Start, const char*& field2End) {
-    // Fast path: no quotes
+static bool parseThreeFields(const char* lineStart, const char* lineEnd,
+                             const char*& field0Start, const char*& field0End,
+                             const char*& field1Start, const char*& field1End,
+                             const char*& field2Start, const char*& field2End) {
     const void* hasQuote = memchr(lineStart, '"', lineEnd - lineStart);
     
     if (!hasQuote) {
@@ -49,7 +48,6 @@ static inline bool parseThreeFields(const char* lineStart, const char* lineEnd,
         return true;
     }
     
-    // Slow path: quote-aware
     bool inQuote = false;
     int fieldIndex = 0;
     const char* fieldStart = lineStart;
@@ -69,7 +67,7 @@ static inline bool parseThreeFields(const char* lineStart, const char* lineEnd,
     return false;
 }
 
-static inline bool extractHourValue(const char* timeStart, const char* timeEnd, int& hourOut) {
+static bool extractHourValue(const char* timeStart, const char* timeEnd, int& hourOut) {
     const char* start = timeStart;
     const char* end = timeEnd;
     cleanBounds(start, end);
@@ -93,14 +91,14 @@ void TripAnalyzer::ingestFile(const string& csvPath) {
     if (!file) return;
 
     zones.clear();
-    zones.reserve(200000);
-    zones.max_load_factor(0.7f);
+    zones.reserve(100000);  // Reduced from 200000
+    zones.max_load_factor(1.0f);  // Increased from 0.7f
 
-    static const size_t BUFFER_SIZE = 1 << 22;
+    static const size_t BUFFER_SIZE = 1 << 20;  // Reduced from 1<<22 (4MB to 1MB)
     static char buffer[BUFFER_SIZE];
 
     string overflow;
-    overflow.reserve(4096);
+    overflow.reserve(2048);  // Reduced from 4096
 
     bool bomProcessed = false;
     bool headerSkipped = false;
@@ -132,7 +130,6 @@ void TripAnalyzer::ingestFile(const string& csvPath) {
                 lineEnd = newline;
             }
 
-            // Remove \r if present
             if (lineEnd > lineStart && lineEnd[-1] == '\r') --lineEnd;
             
             if (lineEnd > lineStart) {
@@ -173,7 +170,11 @@ void TripAnalyzer::ingestFile(const string& csvPath) {
                                     int hour;
                                     if (extractHourValue(f2s, f2e, hour)) {
                                         string zoneName(zoneStart, zoneEnd - zoneStart);
-                                        auto it = zones.try_emplace(move(zoneName), ZoneStats()).first;
+                                        auto it = zones.find(zoneName);
+                                        if (it == zones.end()) {
+                                            zones[zoneName] = ZoneStats();
+                                            it = zones.find(zoneName);
+                                        }
                                         ++it->second.total;
                                         ++it->second.byHour[hour];
                                     }
@@ -189,10 +190,6 @@ void TripAnalyzer::ingestFile(const string& csvPath) {
         }
     }
 
-    if (!overflow.empty()) {
-        // Process final line if needed
-    }
-
     fclose(file);
 }
 
@@ -200,28 +197,27 @@ vector<ZoneCount> TripAnalyzer::topZones(int k) const {
     vector<ZoneCount> results;
     results.reserve(k);
 
-    auto compareZones = [](const ZoneCount& a, const ZoneCount& b) {
-        if (a.count != b.count) return a.count > b.count;
-        return a.zone < b.zone;
-    };
-
     for (const auto& entry : zones) {
         ZoneCount candidate{entry.first, entry.second.total};
         
         if ((int)results.size() < k) {
             results.push_back(candidate);
-            int i = results.size() - 1;
-            while (i > 0 && compareZones(results[i], results[i - 1])) {
-                swap(results[i], results[i - 1]);
-                --i;
-            }
-        } else if (compareZones(candidate, results[k - 1])) {
-            results[k - 1] = candidate;
-            int i = k - 1;
-            while (i > 0 && compareZones(results[i], results[i - 1])) {
-                swap(results[i], results[i - 1]);
-                --i;
-            }
+        } else {
+            bool shouldInsert = false;
+            if (candidate.count > results[k-1].count) shouldInsert = true;
+            else if (candidate.count == results[k-1].count && candidate.zone < results[k-1].zone) shouldInsert = true;
+            
+            if (shouldInsert) results[k-1] = candidate;
+        }
+        
+        
+        for (int i = results.size() - 1; i > 0; --i) {
+            bool needSwap = false;
+            if (results[i].count > results[i-1].count) needSwap = true;
+            else if (results[i].count == results[i-1].count && results[i].zone < results[i-1].zone) needSwap = true;
+            
+            if (needSwap) swap(results[i], results[i-1]);
+            else break;
         }
     }
 
@@ -231,12 +227,6 @@ vector<ZoneCount> TripAnalyzer::topZones(int k) const {
 vector<SlotCount> TripAnalyzer::topBusySlots(int k) const {
     vector<SlotCount> results;
     results.reserve(k);
-
-    auto compareSlots = [](const SlotCount& a, const SlotCount& b) {
-        if (a.count != b.count) return a.count > b.count;
-        if (a.zone != b.zone) return a.zone < b.zone;
-        return a.hour < b.hour;
-    };
 
     for (const auto& entry : zones) {
         const string& zoneName = entry.first;
@@ -250,18 +240,28 @@ vector<SlotCount> TripAnalyzer::topBusySlots(int k) const {
             
             if ((int)results.size() < k) {
                 results.push_back(candidate);
-                int i = results.size() - 1;
-                while (i > 0 && compareSlots(results[i], results[i - 1])) {
-                    swap(results[i], results[i - 1]);
-                    --i;
+            } else {
+                bool shouldInsert = false;
+                if (candidate.count > results[k-1].count) shouldInsert = true;
+                else if (candidate.count == results[k-1].count) {
+                    if (candidate.zone < results[k-1].zone) shouldInsert = true;
+                    else if (candidate.zone == results[k-1].zone && candidate.hour < results[k-1].hour) shouldInsert = true;
                 }
-            } else if (compareSlots(candidate, results[k - 1])) {
-                results[k - 1] = candidate;
-                int i = k - 1;
-                while (i > 0 && compareSlots(results[i], results[i - 1])) {
-                    swap(results[i], results[i - 1]); 
-                    --i;
+                
+                if (shouldInsert) results[k-1] = candidate;
+            }
+            
+           
+            for (int i = results.size() - 1; i > 0; --i) {
+                bool needSwap = false;
+                if (results[i].count > results[i-1].count) needSwap = true;
+                else if (results[i].count == results[i-1].count) {
+                    if (results[i].zone < results[i-1].zone) needSwap = true;
+                    else if (results[i].zone == results[i-1].zone && results[i].hour < results[i-1].hour) needSwap = true;
                 }
+                
+                if (needSwap) swap(results[i], results[i-1]);
+                else break;
             }
         }
     }
